@@ -142,17 +142,6 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                 panic!("transaction state must exist")
             };
 
-            // If there is a conflict with any of the transactions in the current batches,
-            // we should immediately send out the batches, so this transaction may be scheduled.
-            if !relax_intrabatch_account_locks
-                && !self
-                    .working_account_set
-                    .check_locks(transaction_state.transaction())
-            {
-                self.working_account_set.clear();
-                num_sent += self.common.send_batches()?;
-            }
-
             // Now check if the transaction can actually be scheduled.
             match try_schedule_transaction(
                 transaction_state,
@@ -183,6 +172,16 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                     max_age,
                     cost,
                 }) => {
+                    // If the transaction is schedulable, but conflicts with one of the
+                    // transactions already in the current batches, send those batches
+                    // before adding this transaction to a new batch.
+                    if !relax_intrabatch_account_locks
+                        && !self.working_account_set.check_locks(&transaction)
+                    {
+                        self.working_account_set.clear();
+                        num_sent += self.common.send_batches()?;
+                    }
+
                     if !relax_intrabatch_account_locks {
                         assert!(
                             self.working_account_set.take_locks(&transaction),
@@ -638,7 +637,8 @@ mod test {
         // - 3 and 2 are immediately schedulable at the top of the graph.
         // - 3 and 2 will be scheduled to different threads.
         // - 1 conflicts with both 3 and 2 (different threads) so is unschedulable.
-        // - 0 conflicts only with 1. Without priority guarding, it will be scheduled
+        // - 0 conflicts only with 1, so it can still be scheduled after 1 is skipped.
+        // - 1 must not force the current batches to flush, because it is unschedulable.
         let mut container = create_container([
             (Keypair::new(), &[pubkey3][..], 0, 0),
             (Keypair::new(), &[pubkey1, pubkey2, pubkey3][..], 1, 1),
@@ -657,7 +657,7 @@ mod test {
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 1);
-        assert_eq!(collect_work(&work_receivers[0]).1, [vec![3], vec![0]]);
+        assert_eq!(collect_work(&work_receivers[0]).1, [vec![3, 0]]);
         assert_eq!(collect_work(&work_receivers[1]).1, [vec![2]]);
     }
 
